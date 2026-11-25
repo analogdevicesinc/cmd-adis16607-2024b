@@ -1,0 +1,170 @@
+name: Import Release from Cloudsmith
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version to release (e.g. 1.0.0-ga)."
+        required: true
+        type: string
+      tag:
+        description: "Git tag and release title to create (e.g. v1.0.0-ga)."
+        required: true
+        default: "v1.0.0-ga"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CS_NAMESPACE: ${{ secrets.CS_NAMESPACE }}
+      CS_REPO: ${{ secrets.CS_REPO }}
+      PROJECT: ADIS16607_IMU_R2024b
+      REQUESTED_VERSION: ${{ inputs.version }}
+      REQUESTED_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve and download packages
+        id: fetch
+        shell: bash
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CS_NAMESPACE:?CS_NAMESPACE secret is not set}"
+          : "${CS_REPO:?CS_REPO secret is not set}"
+          : "${CLOUDSMITH_API_KEY:?CLOUDSMITH_API_KEY secret is not set}"
+          : "${REQUESTED_VERSION:?version input is required}"
+          : "${REQUESTED_TAG:?tag input is required}"
+          case "${REQUESTED_TAG}" in
+            v*) ;;
+            *) echo "::error::tag must start with 'v' (got '${REQUESTED_TAG}')"; exit 1 ;;
+          esac
+
+          DL="${RUNNER_TEMP}/cloudsmith-dl"
+          mkdir -p "$DL"
+          DOCS_NAME="${PROJECT}-docs"
+
+          api_query () {
+            curl -fsSL \
+              -H "X-Api-Key: ${CLOUDSMITH_API_KEY}" \
+              -H "Accept: application/json" \
+              "https://api.cloudsmith.io/v1/packages/${CS_NAMESPACE}/${CS_REPO}/?query=name:${1}+version:${2}&page_size=50" \
+              | jq -c --arg n "$1" '[.[] | select(.name == $n)][0]' || true
+          }
+
+          CANDIDATES="${REQUESTED_VERSION}"
+          if [ "${REQUESTED_VERSION%%-*}" != "${REQUESTED_VERSION}" ]; then
+            CANDIDATES="${CANDIDATES} ${REQUESTED_VERSION%%-*}"
+          fi
+
+          EFFECTIVE_VERSION=""
+          for v in ${CANDIDATES}; do
+            echo "Looking up '${PROJECT}' and '${DOCS_NAME}' at version '${v}' ..."
+            m="$(api_query "${PROJECT}" "${v}")"
+            d="$(api_query "${DOCS_NAME}" "${v}")"
+            if [ -n "$m" ] && [ "$m" != "null" ] && [ -n "$d" ] && [ "$d" != "null" ]; then
+              EFFECTIVE_VERSION="${v}"
+              MAIN_JSON="$m"
+              DOCS_JSON="$d"
+              echo "Matched both packages at version '${v}'."
+              break
+            fi
+            echo "  no complete match at '${v}'"
+          done
+
+          if [ -z "${EFFECTIVE_VERSION}" ]; then
+            echo "::error::Could not find both '${PROJECT}' and '${DOCS_NAME}' at any of: ${CANDIDATES}"
+            exit 1
+          fi
+
+          MAIN_FILE="$(echo "$MAIN_JSON" | jq -r '.filename')"
+          DOCS_FILE="$(echo "$DOCS_JSON" | jq -r '.filename')"
+          curl -fsSL -H "X-Api-Key: ${CLOUDSMITH_API_KEY}" -o "${DL}/${MAIN_FILE}" "$(echo "$MAIN_JSON" | jq -r '.cdn_url')"
+          curl -fsSL -H "X-Api-Key: ${CLOUDSMITH_API_KEY}" -o "${DL}/${DOCS_FILE}" "$(echo "$DOCS_JSON" | jq -r '.cdn_url')"
+
+          {
+            echo "version=${EFFECTIVE_VERSION}"
+            echo "tag=${REQUESTED_TAG}"
+            echo "main_file=${MAIN_FILE}"
+            echo "docs_file=${DOCS_FILE}"
+            echo "dl_dir=${DL}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail if release already exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.fetch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG} already exists; aborting before any changes are made."
+            exit 1
+          fi
+
+      - name: Replace repository content
+        shell: bash
+        env:
+          DL_DIR: ${{ steps.fetch.outputs.dl_dir }}
+          MAIN_FILE: ${{ steps.fetch.outputs.main_file }}
+          DOCS_FILE: ${{ steps.fetch.outputs.docs_file }}
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.github' -exec rm -rf {} +
+          cp "${DL_DIR}/${MAIN_FILE}" "./${MAIN_FILE}"
+
+          STAGE="$(mktemp -d)"
+          unzip -q -o "${DL_DIR}/${DOCS_FILE}" -d "$STAGE"
+          shopt -s dotglob nullglob
+          entries=("$STAGE"/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            cp -R "${entries[0]}"/. .
+          else
+            echo "::warning::Expected a single top-level folder in ${DOCS_FILE}; copying all extracted contents to root instead."
+            cp -R "$STAGE"/. .
+          fi
+          rm -rf "$STAGE"
+
+      - name: Commit and push
+        id: commit
+        shell: bash
+        env:
+          VERSION: ${{ steps.fetch.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Release ${VERSION}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release and tag
+        if: steps.commit.outputs.committed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.fetch.outputs.version }}
+          TAG: ${{ steps.fetch.outputs.tag }}
+          DL_DIR: ${{ steps.fetch.outputs.dl_dir }}
+          MAIN_FILE: ${{ steps.fetch.outputs.main_file }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${TAG}" \
+            --notes "Automated release of ${PROJECT} ${VERSION}." \
+            "${DL_DIR}/${MAIN_FILE}"
